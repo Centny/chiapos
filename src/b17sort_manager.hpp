@@ -17,17 +17,17 @@
 
 #include <algorithm>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <string>
 #include <vector>
-
-#include "chia_filesystem.hpp"
 
 #include "./bits.hpp"
 #include "./calculate_bucket.hpp"
 #include "./disk.hpp"
 #include "./quicksort.hpp"
 #include "./uniformsort.hpp"
+#include "chia_filesystem.hpp"
 #include "exceptions.hpp"
 
 class b17SortManager {
@@ -175,21 +175,31 @@ public:
     {
         // Close and delete files in case we exit without doing the sort
         for (auto &fd : this->bucket_files) {
-            std::string filename = fd.GetFileName();
-            fd.Close();
-            fs::remove(fs::path(fd.GetFileName()));
+            std::string filename = fd.file.GetFileName();
+            fd.file.Close();
+            fs::remove(fs::path(fd.file.GetFileName()));
         }
         delete[] this->prev_bucket_buf;
         delete[] this->entry_buf;
     }
 
 private:
+    struct bucket_t {
+        bucket_t(FileDisk f) : file(std::move(f)) {}
+
+        // The file for the bucket
+        FileDisk file;
+
+        std::future<void> future;
+        uint8_t started = 0;
+        std::unique_ptr<uint8_t[]> buffer_;
+    };
     // Start of the whole memory array. This will be diveded into buckets
     uint8_t *memory_start;
     // Size of the whole memory array
     uint64_t memory_size;
     // One file for each bucket
-    std::vector<FileDisk> bucket_files;
+    std::vector<bucket_t> bucket_files;
     // Size of each entry
     uint16_t entry_size;
     // Bucket determined by the first "log_num_buckets" bits starting at "begin_bits"
@@ -221,7 +231,8 @@ private:
         uint64_t write_len = this->mem_bucket_sizes[bucket_i] * this->entry_size;
 
         // Flush the bucket to disk
-        bucket_files[bucket_i].Write(start_write, this->mem_bucket_pointers[bucket_i], write_len);
+        bucket_files[bucket_i].file.Write(
+            start_write, this->mem_bucket_pointers[bucket_i], write_len);
         this->bucket_write_pointers[bucket_i] += write_len;
 
         // Reset memory caches
@@ -240,6 +251,7 @@ private:
         uint64_t entries_fit_in_memory = this->memory_size / this->entry_size;
 
         uint32_t entry_len_memory = this->entry_size - this->begin_bits / 8;
+        uint64_t const memory_len = Util::RoundSize(bucket_entries) * entry_size;
 
         double have_ram = entry_size * entries_fit_in_memory / (1024.0 * 1024.0 * 1024.0);
         double qs_ram = entry_size * bucket_entries / (1024.0 * 1024.0 * 1024.0);
@@ -252,20 +264,74 @@ private:
                 std::to_string(this->bucket_write_pointers[bucket_i] / (1024.0 * 1024.0 * 1024.0)) +
                 "GiB");
         }
+        auto time_start = std::chrono::steady_clock::now();
+
+        bucket_t &b = bucket_files[bucket_i];
+        if (!b.started) {  // first start
+            b.future = std::async(&b17SortManager::AsyncSortBucket, this, bucket_i);
+            b.started = 1;
+        }
+        b.future.wait();
+        if (bucket_i + 1 < bucket_files.size()) {  // run async
+            bucket_t &next = bucket_files[bucket_i + 1];
+            next.future = std::async(&b17SortManager::AsyncSortBucket, this, bucket_i + 1);
+            next.started = 1;
+        }
+        memcpy(memory_start, b.buffer_.get(), memory_len);
+        b.buffer_.reset();
+
+        auto time_end = std::chrono::steady_clock::now();
+        auto time_used =
+            std::chrono::duration_cast<std::chrono::milliseconds>(time_end - time_start).count();
+        std::cout << "\tBucket " << bucket_i << " PS. Ram: " << std::fixed << std::setprecision(3)
+                  << have_ram << "GiB, u_sort min: " << u_ram << "GiB, qs min: " << qs_ram
+                  << "GiB, Elapsed: " << (time_used / 1000.0) << " seconds." << std::endl;
+
+        // Deletes the bucket file
+        std::string filename = this->bucket_files[bucket_i].file.GetFileName();
+        this->bucket_files[bucket_i].file.Close();
+        fs::remove(fs::path(filename));
+
+        this->final_position_start = this->final_position_end;
+        this->final_position_end += this->bucket_write_pointers[bucket_i];
+        this->next_bucket_to_sort += 1;
+    }
+
+    void AsyncSortBucket(uint64_t bucket_i)
+    {
+        bucket_t &b = bucket_files[bucket_i];
+        uint64_t bucket_entries = bucket_write_pointers[bucket_i] / this->entry_size;
+        uint64_t entries_fit_in_memory = this->memory_size / this->entry_size;
+        uint64_t const memory_len = Util::RoundSize(bucket_entries) * entry_size;
+
+        uint32_t entry_len_memory = this->entry_size - this->begin_bits / 8;
+
+        double have_ram = entry_size * entries_fit_in_memory / (1024.0 * 1024.0 * 1024.0);
+        double qs_ram = entry_size * bucket_entries / (1024.0 * 1024.0 * 1024.0);
+        double u_ram =
+            Util::RoundSize(bucket_entries) * entry_len_memory / (1024.0 * 1024.0 * 1024.0);
+
+        if (!b.buffer_) {
+            // we allocate the memory to sort the bucket in lazily. It'se freed after used
+            b.buffer_.reset(new uint8_t[memory_len]);
+        }
+        if (bucket_entries > entries_fit_in_memory) {
+            throw InsufficientMemoryException(
+                "Not enough memory for sort in memory. Need to sort " +
+                std::to_string(this->bucket_write_pointers[bucket_i] / (1024.0 * 1024.0 * 1024.0)) +
+                "GiB");
+        }
         bool last_bucket = (bucket_i == this->mem_bucket_pointers.size() - 1) ||
                            this->bucket_write_pointers[bucket_i + 1] == 0;
-        bool force_quicksort = (quicksort == 1) || (quicksort == 2 && last_bucket);
+        bool force_quicksort = last_bucket;
         // Do SortInMemory algorithm if it fits in the memory
         // (number of entries required * entry_len_memory) <= total memory available
         if (!force_quicksort &&
             Util::RoundSize(bucket_entries) * entry_len_memory <= this->memory_size) {
-            std::cout << "\tBucket " << bucket_i << " uniform sort. Ram: " << std::fixed
-                      << std::setprecision(3) << have_ram << "GiB, u_sort min: " << u_ram
-                      << "GiB, qs min: " << qs_ram << "GiB." << std::endl;
             UniformSort::SortToMemory(
-                this->bucket_files[bucket_i],
+                this->bucket_files[bucket_i].file,
                 0,
-                memory_start,
+                b.buffer_.get(),
                 this->entry_size,
                 bucket_entries,
                 this->begin_bits + this->log_num_buckets);
@@ -273,23 +339,10 @@ private:
             // Are we in Compress phrase 1 (quicksort=1) or is it the last bucket (quicksort=2)?
             // Perform quicksort if so (SortInMemory algorithm won't always perform well), or if we
             // don't have enough memory for uniform sort
-            std::cout << "\tBucket " << bucket_i << " QS. Ram: " << std::fixed
-                      << std::setprecision(3) << have_ram << "GiB, u_sort min: " << u_ram
-                      << "GiB, qs min: " << qs_ram << "GiB. force_qs: " << force_quicksort
-                      << std::endl;
-            this->bucket_files[bucket_i].Read(
-                0, this->memory_start, bucket_entries * this->entry_size);
+            this->bucket_files[bucket_i].file.Read(
+                0, b.buffer_.get(), bucket_entries * this->entry_size);
             QuickSort::Sort(this->memory_start, this->entry_size, bucket_entries, this->begin_bits);
         }
-
-        // Deletes the bucket file
-        std::string filename = this->bucket_files[bucket_i].GetFileName();
-        this->bucket_files[bucket_i].Close();
-        fs::remove(fs::path(filename));
-
-        this->final_position_start = this->final_position_end;
-        this->final_position_end += this->bucket_write_pointers[bucket_i];
-        this->next_bucket_to_sort += 1;
     }
 };
 
