@@ -192,7 +192,8 @@ private:
 
         std::future<void> future;
         uint8_t started = 0;
-        std::unique_ptr<uint8_t[]> buffer_;
+        std::unique_ptr<uint8_t[]> buffer;
+        uint64_t buffer_len = 0;
     };
     // Start of the whole memory array. This will be diveded into buckets
     uint8_t *memory_start;
@@ -251,7 +252,6 @@ private:
         uint64_t entries_fit_in_memory = this->memory_size / this->entry_size;
 
         uint32_t entry_len_memory = this->entry_size - this->begin_bits / 8;
-        uint64_t const memory_len = Util::RoundSize(bucket_entries) * entry_size;
 
         double have_ram = entry_size * entries_fit_in_memory / (1024.0 * 1024.0 * 1024.0);
         double qs_ram = entry_size * bucket_entries / (1024.0 * 1024.0 * 1024.0);
@@ -277,8 +277,9 @@ private:
             next.future = std::async(&b17SortManager::AsyncSortBucket, this, bucket_i + 1);
             next.started = 1;
         }
-        memcpy(memory_start, b.buffer_.get(), memory_len);
-        b.buffer_.reset();
+        memcpy(memory_start, b.buffer.get(), b.buffer_len);
+        b.buffer.reset();
+        b.started = 0;
 
         auto time_end = std::chrono::steady_clock::now();
         auto time_used =
@@ -302,7 +303,6 @@ private:
         bucket_t &b = bucket_files[bucket_i];
         uint64_t bucket_entries = bucket_write_pointers[bucket_i] / this->entry_size;
         uint64_t entries_fit_in_memory = this->memory_size / this->entry_size;
-        uint64_t const memory_len = Util::RoundSize(bucket_entries) * entry_size;
 
         uint32_t entry_len_memory = this->entry_size - this->begin_bits / 8;
 
@@ -311,10 +311,6 @@ private:
         double u_ram =
             Util::RoundSize(bucket_entries) * entry_len_memory / (1024.0 * 1024.0 * 1024.0);
 
-        if (!b.buffer_) {
-            // we allocate the memory to sort the bucket in lazily. It'se freed after used
-            b.buffer_.reset(new uint8_t[memory_len]);
-        }
         if (bucket_entries > entries_fit_in_memory) {
             throw InsufficientMemoryException(
                 "Not enough memory for sort in memory. Need to sort " +
@@ -328,10 +324,15 @@ private:
         // (number of entries required * entry_len_memory) <= total memory available
         if (!force_quicksort &&
             Util::RoundSize(bucket_entries) * entry_len_memory <= this->memory_size) {
+            b.buffer_len = Util::RoundSize(bucket_entries) * entry_size;
+            if (!b.buffer) {
+                // we allocate the memory to sort the bucket in lazily. It'se freed after used
+                b.buffer.reset(new uint8_t[b.buffer_len]);
+            }
             UniformSort::SortToMemory(
                 this->bucket_files[bucket_i].file,
                 0,
-                b.buffer_.get(),
+                b.buffer.get(),
                 this->entry_size,
                 bucket_entries,
                 this->begin_bits + this->log_num_buckets);
@@ -339,8 +340,13 @@ private:
             // Are we in Compress phrase 1 (quicksort=1) or is it the last bucket (quicksort=2)?
             // Perform quicksort if so (SortInMemory algorithm won't always perform well), or if we
             // don't have enough memory for uniform sort
+            b.buffer_len = bucket_entries * entry_size;
+            if (!b.buffer) {
+                // we allocate the memory to sort the bucket in lazily. It'se freed after used
+                b.buffer.reset(new uint8_t[b.buffer_len]);
+            }
             this->bucket_files[bucket_i].file.Read(
-                0, b.buffer_.get(), bucket_entries * this->entry_size);
+                0, b.buffer.get(), bucket_entries * this->entry_size);
             QuickSort::Sort(this->memory_start, this->entry_size, bucket_entries, this->begin_bits);
         }
     }
