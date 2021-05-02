@@ -286,20 +286,14 @@ private:
             b.started = 1;
         }
         b.future.wait();
+        if (bucket_i + 1 < buckets_.size()) {  // run async
+            bucket_t& next = buckets_[bucket_i + 1];
+            next.future = std::async(&SortManager::AsyncSortBucket, this, bucket_i + 1);
+            next.started = 1;
+        }
         memcpy(memory_start_.get(), b.buffer.get(), b.buffer_len);
         b.buffer.reset();
         b.started = 0;
-        for (int k = 1; k < 3; k++) {
-            if (bucket_i + k >= buckets_.size()) {  // run async
-                break;
-            }
-            bucket_t& next = buckets_[bucket_i + k];
-            if (next.started) {
-                continue;
-            }
-            next.future = std::async(&SortManager::AsyncSortBucket, this, bucket_i + k);
-            next.started = 1;
-        }
 
         auto time_end = std::chrono::steady_clock::now();
         auto time_used =
